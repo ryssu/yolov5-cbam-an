@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
+from torch.nn.modules.batchnorm import _BatchNorm
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -1141,3 +1142,286 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+
+#CBAM-related Modules
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        """
+        Initialize the Channel Attention module.
+
+        Args:
+            in_planes (int): Number of input channels.
+            ratio (int): Reduction ratio for the hidden channels in the channel attention block.
+        """
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """
+        Forward pass of the Channel Attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            out (torch.Tensor): Output tensor after applying channel attention.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore') 
+            avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
+            max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
+            out = self.sigmoid(avg_out + max_out)
+            return out
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        """
+        Initialize the Spatial Attention module.
+
+        Args:
+            kernel_size (int): Size of the convolutional kernel for spatial attention.
+        """
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """
+        Forward pass of the Spatial Attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            out (torch.Tensor): Output tensor after applying spatial attention.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore') 
+            avg_out = torch.mean(x, dim=1, keepdim=True)
+            max_out, _ = torch.max(x, dim=1, keepdim=True)
+            x = torch.cat([avg_out, max_out], dim=1)
+            x = self.conv(x)
+            return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    # ch_in, ch_out, shortcut, groups, expansion, ratio, kernel_size
+    def __init__(self, c1, c2, kernel_size=3, shortcut=True, g=1, e=0.5, ratio=16):
+        """
+        Initialize the CBAM (Convolutional Block Attention Module) .
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            kernel_size (int): Size of the convolutional kernel.
+            shortcut (bool): Whether to use a shortcut connection.
+            g (int): Number of groups for grouped convolutions.
+            e (float): Expansion factor for hidden channels.
+            ratio (int): Reduction ratio for the hidden channels in the channel attention block.
+        """
+        super(CBAM, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.channel_attention = ChannelAttention(c2, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        """
+        Forward pass of the CBAM .
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            out (torch.Tensor): Output tensor after applying the CBAM bottleneck.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore') 
+            x2 = self.cv2(self.cv1(x))
+            out = self.channel_attention(x2) * x2
+            out = self.spatial_attention(out) * out
+            return x + out if self.add else out
+
+#Attentive Normalization Modules
+class AttnWeights(nn.Module):
+    """ Attention weights for the mixture of affine transformations
+        https://arxiv.org/abs/1908.01259
+    """
+    def __init__(self,
+                 attn_mode,
+                 num_features,
+                 num_affine_trans,
+                 num_groups=1,
+                 use_rsd=True,
+                 use_maxpool=False,
+                 eps=1e-3,
+                act_cfg=dict(type="SiLU") # Changed from HSigmoidv2
+                ):
+        super(AttnWeights, self).__init__()
+
+        if use_rsd:
+            use_maxpool = False
+
+        self.num_affine_trans = num_affine_trans
+        self.use_rsd = use_rsd
+        self.use_maxpool = use_maxpool
+        self.eps = eps
+        if not self.use_rsd:
+            self.avgpool = nn.AdaptiveAvgPool2d(1)
+
+        layers = []
+        if attn_mode == 0:
+            layers = [nn.Conv2d(num_features, num_affine_trans, 1, bias=False),
+                      #nn.BatchNorm2d(num_affine_trans),
+                      nn.SiLU(inplace=True)]
+        elif attn_mode == 1:
+            if num_groups > 0:
+                assert num_groups <= num_affine_trans
+                layers = [nn.Conv2d(num_features, num_affine_trans, 1, bias=False),
+                        nn.GroupNorm(num_channels=num_affine_trans,
+                                    num_groups=num_groups),
+                        nn.SiLU(inplace=True)
+                        ]
+            else:
+                layers = [nn.Conv2d(num_features, num_affine_trans, 1, bias=False),
+                          #nn.BatchNorm2d(num_affine_trans),
+                          nn.SiLU(inplace=True)
+                          ]
+        else:
+            raise NotImplementedError("Unknow attention weight type")
+
+        self.attention = nn.Sequential(*layers)
+
+        self.init_params()
+
+    def init_params(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1) / nn.init.constant_(m.bias, 0)
+    def forward(self, x):
+        b, c, h, w = x.size()
+        if self.use_rsd:
+            var, mean = torch.var_mean(x, dim=(2, 3), keepdim=True)
+            y = mean * (var + self.eps).rsqrt()
+
+            # var = torch.var(x, dim=(2, 3), keepdim=True)
+            # y *= (var + self.eps).rsqrt()
+        else:
+            y = self.avgpool(x)
+            if self.use_maxpool:
+                y += fu.max_pool2d(x, (h, w), stride=(h, w)).view(b, c, 1, 1)
+        return self.attention(y).view(b, self.num_affine_trans)
+
+
+class AttnBatchNorm2d(nn.BatchNorm2d):
+    """ Attentive Normalization with BatchNorm2d backbone
+        https://arxiv.org/abs/1908.01259
+    """
+
+    _abbr_ = "AttnBN2d"
+
+    def __init__(self,
+                 num_features,
+                 num_affine_trans=10,
+                 attn_mode=0,
+                 eps=1e-5,
+                 momentum=0.1,
+                 track_running_stats=True,
+                 use_rsd=True,
+                 use_maxpool=False,
+                 eps_var=1e-3,
+                 act_cfg=dict(type="SiLU") # Changed from HSigmoidv2
+                 ):
+        super(AttnBatchNorm2d, self).__init__(num_features,
+                                              affine=False,
+                                              eps=eps,
+                                              momentum=momentum,
+                                              track_running_stats=track_running_stats)
+
+        self.num_affine_trans = num_affine_trans
+        self.attn_mode = attn_mode
+        self.use_rsd = use_rsd
+        self.eps_var = eps_var
+        self.act_cfg = act_cfg
+
+        self.weight_ = nn.Parameter(
+            torch.Tensor(num_affine_trans, num_features))
+        self.bias_ = nn.Parameter(
+            torch.Tensor(num_affine_trans, num_features))
+
+        self.attn_weights = AttnWeights(attn_mode,
+                                        num_features,
+                                        num_affine_trans,
+                                        use_rsd=use_rsd,
+                                        use_maxpool=use_maxpool,
+                                        eps=eps_var,
+                                        act_cfg=act_cfg
+                                        )
+
+        self._init_params()
+
+    def _init_params(self):
+        nn.init.normal_(self.weight_, 1., 0.1)
+        nn.init.normal_(self.bias_, 0., 0.1)
+
+    def forward(self, x):
+        output = super(AttnBatchNorm2d, self).forward(x)
+        size = output.size()
+        y = self.attn_weights(x)  # bxk
+
+        weight = y @ self.weight_  # bxc
+        bias = y @ self.bias_  # bxc
+        weight = weight.unsqueeze(-1).unsqueeze(-1).expand(size)
+        bias = bias.unsqueeze(-1).unsqueeze(-1).expand(size)
+
+        return weight * output + bias
+
+class ConvAN(nn.Module):
+    """ Re-implements built-in Convolution module with AN Batch Normalization"""
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initializes a standard convolution layer with optional batch normalization and activation."""
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = AttnBatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        """Applies a convolution followed by batch normalization and an activation function to the input tensor `x`."""
+        return self.act(self.bn(self.conv(x)))
+
+    def forward_fuse(self, x):
+        """Applies a fused convolution and activation function to the input tensor `x`."""
+        return self.act(self.conv(x))
+
+class C3AN(nn.Module):
+    """Replaces C3 Convolutions with Attentive Normalization Implementation"""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """Initializes C3 module with options for channel count, bottleneck repetition, shortcut usage, group
+        convolutions, and expansion.
+        """
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = ConvAN(c1, c_, 1, 1)
+        self.cv2 = ConvAN(c1, c_, 1, 1)
+        self.cv3 = ConvAN(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        """Performs forward propagation using concatenated outputs from two convolutions and a Bottleneck sequence."""
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
