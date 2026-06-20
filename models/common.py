@@ -21,6 +21,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as fu
 from PIL import Image
 from torch.cuda import amp
 from torch.nn.modules.batchnorm import _BatchNorm
@@ -1265,7 +1266,7 @@ class AttnWeights(nn.Module):
                  num_groups=1,
                  use_rsd=True,
                  use_maxpool=False,
-                 eps=1e-3,
+                 eps=1e-1,
                 act_cfg=dict(type="SiLU") # Changed from HSigmoidv2
                 ):
         super(AttnWeights, self).__init__()
@@ -1323,7 +1324,9 @@ class AttnWeights(nn.Module):
             y = self.avgpool(x)
             if self.use_maxpool:
                 y += fu.max_pool2d(x, (h, w), stride=(h, w)).view(b, c, 1, 1)
-        return self.attention(y).view(b, self.num_affine_trans)
+        y = self.attention(y).view(b, self.num_affine_trans)
+        y = fu.softmax(y, dim=1)
+        return y # self.attention(y).view(b, self.num_affine_trans)
 
 
 class AttnBatchNorm2d(nn.BatchNorm2d):
