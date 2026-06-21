@@ -1250,8 +1250,8 @@ class CBAM(nn.Module):
         with warnings.catch_warnings():
             warnings.simplefilter('ignore') 
             x2 = self.cv2(self.cv1(x))
-            out = self.channel_attention(x2) * x2
-            out = self.spatial_attention(out) * out
+            # out = self.channel_attention(x2) * x2 # Original channel attention
+            out = self.spatial_attention(x2) * x2 # Spatial attention
             return x + out if self.add else out
 
 #Attentive Normalization Modules
@@ -1266,7 +1266,7 @@ class AttnWeights(nn.Module):
                  num_groups=1,
                  use_rsd=True,
                  use_maxpool=False,
-                 eps=1e-1,
+                 eps=1e-3,
                 act_cfg=dict(type="SiLU") # Changed from HSigmoidv2
                 ):
         super(AttnWeights, self).__init__()
